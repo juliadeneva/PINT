@@ -391,7 +391,7 @@ class Pulsar(object):
             self.postfit_model.components["PhaseJump"].setup()
         return param.name
 
-    def fit(self, selected, iters=1):
+    def fit(self, selected, iters=1, dorandom=0):
         """
         Run a fit using the specified fitter
         """
