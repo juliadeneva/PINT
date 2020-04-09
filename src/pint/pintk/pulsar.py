@@ -490,7 +490,8 @@ class Pulsar(object):
 
         selectedMJDs = self.selected_toas.get_mjds()
         if all(no_jumps):
-            q = list(self.all_toas.get_mjds())
+            #q = list(self.all_toas.get_mjds())
+            q = list(allMJDs)
             index = q.index(
                 [i for i in self.all_toas.get_mjds() if i > selectedMJDs.min()][0]
             )
@@ -506,28 +507,18 @@ class Pulsar(object):
         # TODO: hard limit on how far fake toas can go --> can get clkcorr
         # errors if go before GBT existed, etc.
         minMJD, maxMJD = selectedMJDs.min(), selectedMJDs.max()
+        allminMJD, allmaxMJD = allMJDs.min(), allMJDs.max()
         spanMJDs = maxMJD - minMJD
-        if spanMJDs < 30 * u.d:
-            redge = ledge = 4
-            npoints = 400
-        elif spanMJDs < 90 * u.d:
-            redge = ledge = 2
-            npoints = 300
-        elif spanMJDs < 200 * u.d:
-            redge = ledge = 1
-            npoints = 300
-        elif spanMJDs < 400 * u.d:
-            redge = ledge = 0.5
-            npoints = 200
-        else:
-            redge = ledge = 0.2
-            npoints = 150
-        # Check to see if too recent
-        nowish = (Time.now().mjd - 40) * u.d
-        if maxMJD + spanMJDs * redge > nowish:
-            redge = (nowish - maxMJD) / spanMJDs
-            if redge < 0.0:
-                redge = 0.0
+
+        # Models (fake toas) will cover full TOA span
+        ledge = (minMJD-allminMJD)/spanMJDs
+        redge = (allmaxMJD-maxMJD)/spanMJDs
+        npoints = 200
+
+        # To do: Have checkboxes in GUI for:
+        # (1) Toggling models on/off
+        # (2) Extend models left/right by some fraction of total TOA span; or up to now, whichever is sooner. 
+
         f_toas, rs = random_models(
             f,
             rs_mean=rs_mean,
