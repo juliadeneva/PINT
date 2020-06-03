@@ -12,6 +12,7 @@ import astropy.constants as const
 import pint.utils
 from pint.models.pulsar_binary import PulsarBinary
 from pint import Tsun
+from pint.utils import FTest
 
 from pint.residuals import Residuals
 from pint.models.parameter import (
@@ -175,8 +176,14 @@ class Fitter(object):
         ax.grid(True)
         plt.show()
 
-    def get_summary(self):
-        """Return a human-readable summary of the Fitter results."""
+    def get_summary(self, nodmx=False):
+        """Return a human-readable summary of the Fitter results.
+        
+        Parameters
+        ----------
+        nodmx : bool
+            Set to True to suppress printing DMX parameters in summary
+        """
 
         # Need to check that fit has been done first!
         if not hasattr(self, "covariance_matrix"):
@@ -191,7 +198,7 @@ class Fitter(object):
         s = "Fitted model using {} method with {} free parameters to {} TOAs\n".format(
             self.method, len(self.get_fitparams()), self.toas.ntoas
         )
-        s += "Prefit residuals {}, Postfit residuals {}\n".format(
+        s += "Prefit residuals Wrms = {}, Postfit residuals Wrms = {}\n".format(
             self.resids_init.rms_weighted(), self.resids.rms_weighted()
         )
         s += "Chisq = {:.3f} for {} d.o.f. for reduced Chisq of {:.3f}\n".format(
@@ -205,6 +212,8 @@ class Fitter(object):
             "=" * 14, "=" * 20, "=" * 28, "=" * 5
         )
         for pn in list(self.get_allparams().keys()):
+            if nodmx and pn.startswith("DMX"):
+                continue
             prefitpar = getattr(self.model_init, pn)
             par = getattr(self.model, pn)
             if par.value is not None:
@@ -375,22 +384,28 @@ class Fitter(object):
                     )
 
                 if hasattr(self.model, "SINI"):
-                    if not self.model.SINI.frozen:
-                        si = ufloat(
-                            self.model.SINI.quantity.value,
-                            self.model.SINI.uncertainty.value,
-                        )
-                        s += "From SINI in model:\n"
-                        s += "    cos(i) = {:SP}\n".format(um.sqrt(1 - si ** 2))
-                        s += "    i = {:SP} deg\n".format(um.asin(si) * 180.0 / np.pi)
+                    try:
+                        # Put this in a try in case SINI is UNSET or an illegal value
+                        if not self.model.SINI.frozen:
+                            si = ufloat(
+                                self.model.SINI.quantity.value,
+                                self.model.SINI.uncertainty.value,
+                            )
+                            s += "From SINI in model:\n"
+                            s += "    cos(i) = {:SP}\n".format(um.sqrt(1 - si ** 2))
+                            s += "    i = {:SP} deg\n".format(
+                                um.asin(si) * 180.0 / np.pi
+                            )
 
-                    psrmass = pint.utils.pulsar_mass(
-                        self.model.PB.quantity,
-                        self.model.A1.quantity,
-                        self.model.M2.quantity,
-                        np.arcsin(self.model.SINI.quantity),
-                    )
-                    s += "Pulsar mass (Shapiro Delay) = {}".format(psrmass)
+                        psrmass = pint.utils.pulsar_mass(
+                            self.model.PB.quantity,
+                            self.model.A1.quantity,
+                            self.model.M2.quantity,
+                            np.arcsin(self.model.SINI.quantity),
+                        )
+                        s += "Pulsar mass (Shapiro Delay) = {}".format(psrmass)
+                    except:
+                        pass
 
         return s
 
@@ -467,6 +482,112 @@ class Fitter(object):
                 "You must run .fit_toas() before accessing the correlation matrix"
             )
             raise AttributeError
+
+    def ftest(self, parameter, component, remove=False, full_output=False):
+        """Compare the significance of adding/removing parameters to a timing model.
+
+        Parameters
+        -----------
+        parameter : PINT parameter object
+            (may be a list of parameter objects)
+        component : String
+            Name of component of timing model that the parameter should be added to (may be a list)
+            The number of components must equal number of parameters.
+        remove : Bool
+            If False, will add the listed parameters to the model. If True will remove the input
+            parameters from the timing model.
+        full_output : Bool
+            If False, just returns the result of the F-Test. If True, will also return the new
+            model's residual RMS (us), chi-squared, and number of degrees of freedom of 
+            new model.
+
+        Returns
+        --------
+        ft : Float
+            F-test significance value for the model with the larger number of
+            components over the other. Computed with pint.utils.FTest().
+        resid_rms_test : Float (Quantity)
+            If full_output is True, returns the RMS of the residuals of the tested model
+            fit. Will be in units of microseconds as an astropy quantity.
+        chi2_test : Float
+            If full_output is True, returns the chi-squared of the tested model.
+        dof_test : Int
+            If full_output is True, returns the degrees of freedom of the tested model.
+        """
+        # Copy the fitter that we do not change the initial model and fitter
+        fitter_copy = copy.deepcopy(self)
+        # Number of times to run the fit
+        NITS = 1
+        # We need the original degrees of freedome and chi-squared value
+        # Because this applies to nested models, model 1 must always have fewer parameters
+        if remove:
+            dof_2 = self.resids.get_dof()
+            chi2_2 = self.resids.calc_chi2()
+        else:
+            dof_1 = self.resids.get_dof()
+            chi2_1 = self.resids.calc_chi2()
+        # Single inputs are converted to lists to handle arb. number of parameteres
+        if type(parameter) is not list:
+            parameter = [parameter]
+        # also do the components
+        if type(component) is not list:
+            component = [component]
+        # if not the same length, exit with error
+        if len(parameter) != len(component):
+            raise RuntimeError(
+                "Number of input parameters must match number of input components."
+            )
+        # Now check if we want to remove or add components; start with removing
+        if remove:
+            # Set values to zero and freeze them
+            for p in parameter:
+                getattr(fitter_copy.model, "{:}".format(p.name)).value = 0.0
+                getattr(fitter_copy.model, "{:}".format(p.name)).uncertainty_value = 0.0
+                getattr(fitter_copy.model, "{:}".format(p.name)).frozen = True
+            # validate and setup model
+            fitter_copy.model.validate()
+            fitter_copy.model.setup()
+            # Now refit
+            fitter_copy.fit_toas(NITS)
+            # Now get the new values
+            dof_1 = fitter_copy.resids.get_dof()
+            chi2_1 = fitter_copy.resids.calc_chi2()
+        else:
+            # Add the parameters
+            for ii in range(len(parameter)):
+                # Check if parameter already exists in model
+                if hasattr(fitter_copy.model, "{:}".format(parameter[ii].name)):
+                    # Set frozen to False
+                    getattr(
+                        fitter_copy.model, "{:}".format(parameter[ii].name)
+                    ).frozen = False
+                # If not, add it to the model
+                else:
+                    fitter_copy.model.components[component[ii]].add_param(
+                        parameter[ii], setup=True
+                    )
+            # validate and setup model
+            fitter_copy.model.validate()
+            fitter_copy.model.setup()
+            # Now refit
+            fitter_copy.fit_toas(NITS)
+            # Now get the new values
+            dof_2 = fitter_copy.resids.get_dof()
+            chi2_2 = fitter_copy.resids.calc_chi2()
+        # Now run the actual F-test
+        ft = FTest(chi2_1, dof_1, chi2_2, dof_2)
+
+        if full_output:
+            if remove:
+                dof_test = dof_1
+                chi2_test = chi2_1
+            else:
+                dof_test = dof_2
+                chi2_test = chi2_2
+            resid_rms_test = fitter_copy.resids.time_resids.std().to(u.us)
+            return ft, resid_rms_test, chi2_test, dof_test
+        else:
+            return ft
 
 
 class PowellFitter(Fitter):

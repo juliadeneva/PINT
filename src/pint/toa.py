@@ -21,6 +21,7 @@ from astropy import log
 from astropy.coordinates import EarthLocation
 from six.moves import cPickle as pickle
 
+import pint
 from pint.observatory import Observatory, get_observatory
 from pint.observatory.special_locations import SpacecraftObs
 from pint.observatory.topo_obs import TopoObs
@@ -188,7 +189,12 @@ def _toa_format(line, fmt="Unknown"):
     """
     if re.match(r"[0-9a-z@] ", line):
         return "Princeton"
-    elif line.startswith("C ") or line.startswith("c ") or line[0] == "#":
+    elif (
+        line.startswith("C ")
+        or line.startswith("c ")
+        or line[0] == "#"
+        or line.startswith("CC ")
+    ):
         return "Comment"
     elif line.upper().startswith(toa_commands):
         return "Command"
@@ -749,7 +755,7 @@ class TOAs(object):
                     self.get_freqs(),
                     self.get_obss(),
                     self.get_flags(),
-                    np.zeros(len(mjds)) * u.cycle,
+                    np.zeros(len(mjds)),
                     self.get_groups(),
                 ],
                 names=(
@@ -854,7 +860,7 @@ class TOAs(object):
         # TODO: use a masked array?  Only some pulse numbers may be known
         if hasattr(self, "toas"):
             try:
-                return np.array([t.flags["pn"] for t in self.toas]) * u.cycle
+                return np.array([t.flags["pn"] for t in self.toas])
             except KeyError:
                 log.warning("Not all TOAs have pulse numbers, using none")
                 return None
@@ -864,7 +870,7 @@ class TOAs(object):
                     raise ValueError(
                         "Pulse number cannot be both a column and a TOA flag"
                     )
-                return np.array(flags["pn"] for flags in self.table["flags"]) * u.cycle
+                return np.array(flags["pn"] for flags in self.table["flags"])
             elif "pulse_number" in self.table.colnames:
                 return self.table["pulse_number"]
             else:
@@ -971,14 +977,15 @@ class TOAs(object):
 
     def unselect(self):
         """Return to previous selected version of the TOA table (stored in stack)."""
-        if hasattr(self, "table_selects"):
-            # may raise an exception about an empty list
+        try:
             self.table = self.table_selects.pop()
-        else:
-            raise ValueError("No previous TOA table found.  No changes made.")
+        except (AttributeError, IndexError) as e:
+            log.error("No previous TOA table found.  No changes made.")
 
     def pickle(self, filename=None):
         """Write the TOAs to a .pickle file with optional filename."""
+        # Save the PINT version used to create this pickle file
+        self.pintversion = pint.__version__
         if filename is not None:
             pickle.dump(self, open(filename, "wb"))
         elif self.filename is not None:
@@ -999,11 +1006,11 @@ class TOAs(object):
         for ii, key in enumerate(self.table.groups.keys):
             grp = self.table.groups[ii]
             s += "%s TOAs (%d):\n" % (key["obs"], len(grp))
-            s += "  Min error:     %.3g us\n" % np.min(grp["error"])
-            s += "  Max error:     %.3g us\n" % np.max(grp["error"])
-            s += "  Mean error:    %.3g us\n" % np.mean(grp["error"])
-            s += "  Median error:  %.3g us\n" % np.median(grp["error"])
-            s += "  Error stddev:  %.3g us\n" % np.std(grp["error"])
+            s += "  Min freq:      {:.3f} \n".format(np.min(grp["freq"].to(u.MHz)))
+            s += "  Max freq:      {:.3f} \n".format(np.max(grp["freq"].to(u.MHz)))
+            s += "  Min error:     {:.3g}\n".format(np.min(grp["error"].to(u.us)))
+            s += "  Max error:     {:.3g}\n".format(np.max(grp["error"].to(u.us)))
+            s += "  Median error:  {:.3g}\n".format(np.median(grp["error"].to(u.us)))
         return s
 
     def print_summary(self):
@@ -1017,25 +1024,30 @@ class TOAs(object):
         Modifes the delta_pulse_number column, if required.
         Removes the pulse numbers from the flags.
         """
-        # Add pulse_number as a table column if possible
-        try:
-            pns = [flags["pn"] for flags in self.table["flags"]]
-            self.table["pulse_number"] = pns
-            self.table["pulse_number"].unit = u.cycle
-
-            # Remove pn from dictionary to prevent redundancies
-            for flags in self.table["flags"]:
-                del flags["pn"]
-        except KeyError:
-            raise ValueError("Not all TOAs have pn flags")
-        # modify the delta_pulse_number column if required
+        # First get any PHASE commands
         dphs = np.asarray(
             [
                 flags["phase"] if "phase" in flags else 0.0
                 for flags in self.table["flags"]
             ]
         )
+        # Then add any -padd flag values
+        dphs += np.asarray(
+            [flags["padd"] if "padd" in flags else 0.0 for flags in self.table["flags"]]
+        )
         self.table["delta_pulse_number"] += dphs
+
+        # Then, add pulse_number as a table column if possible
+        try:
+            pns = [flags["pn"] for flags in self.table["flags"]]
+            self.table["pulse_number"] = pns
+            self.table["pulse_number"].unit = u.dimensionless_unscaled
+
+            # Remove pn from dictionary to prevent redundancies
+            for flags in self.table["flags"]:
+                del flags["pn"]
+        except KeyError:
+            raise ValueError("Not all TOAs have pn flags")
 
     def compute_pulse_numbers(self, model):
         """Set pulse numbers (in TOA table column pulse_numbers) based on model
@@ -1047,7 +1059,7 @@ class TOAs(object):
         # paulr: I think pulse numbers should be computed with abs_phase=True!
         phases = model.phase(self, abs_phase=True)
         self.table["pulse_number"] = phases.int
-        self.table["pulse_number"].unit = u.cycle
+        self.table["pulse_number"].unit = u.dimensionless_unscaled
 
     def adjust_TOAs(self, delta):
         """Apply a time delta to TOAs
@@ -1421,12 +1433,21 @@ class TOAs(object):
         else:
             infile = open(filename, "rb")
         tmp = pickle.load(infile)
+        if not hasattr(tmp, "pintversion") or tmp.pintversion != pint.__version__:
+            log.error(
+                "PINT version in pickle file is different than current version!\n*** Suggest deleting {}".format(
+                    filename
+                )
+            )
         self.filename = tmp.filename
         if hasattr(tmp, "toas"):
             self.toas = tmp.toas
         if hasattr(tmp, "table"):
             self.table = tmp.table.group_by("obs")
         self.commands = tmp.commands
+        self.clock_corr_info = tmp.clock_corr_info
+        self.ephem = tmp.ephem
+        self.planets = tmp.planets
 
     def read_toa_file(self, filename, process_includes=True, top=True):
         """Read TOAs from the given filename.

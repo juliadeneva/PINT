@@ -10,6 +10,8 @@ import astropy.constants as const
 import numpy as np
 import six
 import scipy.optimize.zeros as zeros
+from scipy.special import fdtrc
+
 
 from io import StringIO
 
@@ -28,6 +30,9 @@ __all__ = [
     "interesting_lines",
     "show_param_cov_matrix",
     "dmxparse",
+    "dmxstats",
+    "dmx_ranges_old",
+    "dmx_ranges",
     "p_to_f",
     "pferrs",
     "weighted_mean",
@@ -40,6 +45,7 @@ __all__ = [
     "pulsar_edot",
     "pulsar_B",
     "pulsar_B_lightcyl",
+    "FTest",
 ]
 
 
@@ -452,6 +458,388 @@ def show_param_cov_matrix(matrix, params, name="Covariance Matrix", switchRD=Fal
     return contents
 
 
+def pmtot(model):
+    """Compute and return the total proper motion from a model object
+    
+    Calculates total proper motion from the parameters of the model, in either
+    equatorial or ecliptic coordinates.  Note that in both cases, pulsar timing
+    codes define the proper motion in the longitude coordinate to be the 
+    the actual angular rate of change of position on the sky rather than the change in coordinate value,
+    so PMRA = (d(RAJ)/dt)*cos(DECJ). This is different from the astrometry community where mu_alpha = d(alpha)/dt.
+    Thus, we don't need to include cos(DECJ) or cos(ELAT) in our calculation.
+
+    Returns
+    -------
+    pmtot : Quantity
+        Returns total proper motion with units of u.mas/u.yr
+
+    Raises
+    ------
+        AttributeError if no Astrometry component is found in the model
+    """
+
+    if "AstrometryEcliptic" in model.components.keys():
+        return np.sqrt(model.PMELONG.quantity ** 2 + model.PMELAT.quantity ** 2).to(
+            u.mas / u.yr
+        )
+    elif "AstrometryEquatorial" in model.components.keys():
+        return np.sqrt(model.PMRA.quantity ** 2 + model.PMDEC.quantity ** 2).to(
+            u.mas / u.yr
+        )
+    else:
+        raise AttributeError("No Astrometry component found")
+
+
+class dmxrange:
+    """Internal class for building DMX ranges"""
+
+    def __init__(self, lofreqs, hifreqs):
+        """lofreqs and hifreqs are lists of MJDs that are in the low or high band respectively"""
+        self.los = lofreqs
+        self.his = hifreqs
+        self.min = min(lofreqs + hifreqs) - 0.001 * u.d
+        self.max = max(lofreqs + hifreqs) + 0.001 * u.d
+
+    def sum_print(self):
+        print(
+            "{:8.2f}-{:8.2f} ({:8.2f}): NLO={:5d} NHI={:5d}".format(
+                self.min.value,
+                self.max.value,
+                self.max - self.min,
+                len(self.los),
+                len(self.his),
+            )
+        )
+
+
+def dmx_ranges_old(
+    toas,
+    divide_freq=1000.0 * u.MHz,
+    offset=0.01 * u.d,
+    max_diff=15.0 * u.d,
+    verbose=False,
+):
+    """Compute initial DMX ranges for a set of TOAs
+    
+    This is a rudimentary translation of $TEMPO/utils/dmx_ranges/DMX_ranges2.py
+
+    Parameters
+    ----------
+    divide_freq : Quantity, MHz
+        Requires TOAs above and below this freq for a good DMX range
+    offset : Quantity, days
+        The buffer to include around each DMX range. Warning, may cause bins to overlap?!?
+    max_diff : Quantity, days
+        Maximum duration of a DMX bin
+    verbose : bool
+        If True, print out verbose information about the DMX ranges including par file lines.
+
+    Returns
+    -------
+    mask : bool array
+        Array with True for all TOAs that got assigned to a DMX bin
+    component : TimingModel.Component object
+        A DMX Component class with the DMX ranges included
+    """
+    from pint.models.timing_model import Component
+    import pint.models.parameter
+
+    MJDs = toas.get_mjds()
+    freqs = toas.table["freq"]
+
+    loMJDs = MJDs[freqs < divide_freq]
+    hiMJDs = MJDs[freqs > divide_freq]
+    # Round off the dates to 0.1 days and only keep unique values so we ignore closely spaced TOAs
+    loMJDs = np.unique(loMJDs.round(1))
+    hiMJDs = np.unique(hiMJDs.round(1))
+    log.info("There are {} dates with freqs > {} MHz".format(len(hiMJDs), divide_freq))
+    log.info(
+        "There are {} dates with freqs < {} MHz\n".format(len(loMJDs), divide_freq)
+    )
+
+    DMXs = []
+
+    good_his = set([])
+    bad_los = []
+    # Walk through all of the low freq obs
+    for ii, loMJD in enumerate(loMJDs):
+        # find all the high freq obs within max_diff days
+        # of the low freq obs
+        hi_close = hiMJDs[np.fabs(hiMJDs - loMJD) < max_diff]
+        # and where they are closer to this loMJD compared to the
+        # other nearby ones
+        if ii > 0:
+            diffs = np.fabs(hi_close - loMJD)
+            lodiffs = np.fabs(hi_close - loMJDs[ii - 1])
+            hi_close = hi_close[diffs < lodiffs]
+        if ii < len(loMJDs) - 1:
+            diffs = np.fabs(hi_close - loMJD)
+            hidiffs = np.fabs(hi_close - loMJDs[ii + 1])
+            hi_close = hi_close[diffs < hidiffs]
+        if len(hi_close):  # add a DMXrange
+            DMXs.append(dmxrange([loMJD], list(hi_close)))
+            good_his = good_his.union(set(hi_close))
+        else:
+            bad_los.append(loMJD)
+
+    bad_los = set(bad_los)
+    saved_los = []
+    # print bad_los
+    # Now walk through the DMXs and see if we can't fit a bad_lo freq in
+    for bad_lo in bad_los:
+        absmindiff = 2 * max_diff
+        ind = 0
+        for ii, DMX in enumerate(DMXs):
+            if (
+                np.fabs(bad_lo - DMX.min) < max_diff
+                and np.fabs(bad_lo - DMX.max) < max_diff
+            ):
+                mindiff = min(np.fabs(bad_lo - DMX.min), np.fabs(bad_lo - DMX.max))
+                if mindiff < absmindiff:
+                    absmindiff = mindiff
+                    ind = ii
+        if absmindiff < max_diff:
+            # print DMXs[ind].min, DMXs[ind].max, bad_lo
+            DMXs[ind].los.append(bad_lo)
+            # update the min and max vals
+            DMXs[ind].min = min(DMXs[ind].los + DMXs[ind].his)
+            DMXs[ind].max = max(DMXs[ind].los + DMXs[ind].his)
+            saved_los.append(bad_lo)
+
+    # These are the low-freq obs we can't save
+    bad_los -= set(saved_los)
+    bad_los = sorted(list(bad_los))
+
+    # These are the high-freq obs we can't save
+    bad_his = set(hiMJDs) - good_his
+    bad_his = sorted(list(bad_his))
+
+    if verbose:
+        print("\n These are the 'good' ranges for DMX and days are low/high freq:")
+        for DMX in DMXs:
+            DMX.sum_print()
+
+        print("\nRemove high-frequency data from these days:")
+        for hibad in bad_his:
+            print("{:8.2f}".format(hibad.value))
+        print("\nRemove low-frequency data from these days:")
+        for lobad in bad_los:
+            print("{:8.2f}".format(lobad.value))
+
+        print("\n Enter the following in your parfile")
+        print("-------------------------------------")
+        print("DMX         {:.2f}".format(max_diff.value))
+        oldmax = 0.0
+        for ii, DMX in enumerate(DMXs):
+            print("DMX_{:04d}      0.0       {}".format(ii + 1, 1))
+            print("DMXR1_{:04d}      {:10.4f}".format(ii + 1, (DMX.min - offset).value))
+            print("DMXR2_{:04d}      {:10.4f}".format(ii + 1, (DMX.max + offset).value))
+            if DMX.min < oldmax:
+                print("Ack!  This shouldn't be happening!")
+            oldmax = DMX.max
+    # Init mask to all False
+    mask = np.zeros_like(MJDs.value, dtype=np.bool)
+    # Mark TOAs as True if they are in any DMX bin
+    for DMX in DMXs:
+        mask[np.logical_and(MJDs > DMX.min - offset, MJDs < DMX.max + offset)] = True
+    log.info("{} out of {} TOAs are in a DMX bin".format(mask.sum(), len(mask)))
+    # Instantiate a DMX component
+    dmx_class = Component.component_types["DispersionDMX"]
+    dmx_comp = dmx_class()
+    # Add parameters
+    for ii, DMX in enumerate(DMXs):
+        if ii == 0:
+            # Already have DMX_0001 in component, so just set parameters
+            dmx_comp.DMX_0001.value = 0.0
+            dmx_comp.DMX_0001.frozen = False
+            dmx_comp.DMXR1_0001.value = (DMX.min - offset).value
+            dmx_comp.DMXR2_0001.value = (DMX.max + offset).value
+
+        else:
+            # Add the DMX parameters
+            dmx_par = pint.models.parameter.prefixParameter(
+                parameter_type="float",
+                name="DMX_{:04d}".format(ii + 1),
+                value=0.0,
+                units=u.pc / u.cm ** 3,
+                frozen=False,
+            )
+            dmx_comp.add_param(dmx_par, setup=True)
+
+            dmxr1_par = pint.models.parameter.prefixParameter(
+                parameter_type="mjd",
+                name="DMXR1_{:04d}".format(ii + 1),
+                value=(DMX.min - offset).value,
+                units=u.d,
+            )
+            dmx_comp.add_param(dmxr1_par, setup=True)
+
+            dmxr2_par = pint.models.parameter.prefixParameter(
+                parameter_type="mjd",
+                name="DMXR2_{:04d}".format(ii + 1),
+                value=(DMX.max + offset).value,
+                units=u.d,
+            )
+            dmx_comp.add_param(dmxr2_par, setup=True)
+    # Validate component
+    dmx_comp.validate()
+
+    return mask, dmx_comp
+
+
+def dmx_ranges(toas, divide_freq=1000.0 * u.MHz, binwidth=15.0 * u.d, verbose=False):
+    """Compute initial DMX ranges for a set of TOAs
+    
+    This is an alternative algorithm for computing DMX ranges
+
+    Parameters
+    ----------
+    divide_freq : Quantity, MHz
+        Requires TOAs above and below this freq for a good DMX range
+    offset : Quantity, days
+        The buffer to include around each DMX range. Warning, may cause bins to overlap?!?
+    max_diff : Quantity, days
+        Maximum duration of a DMX bin
+    verbose : bool
+        If True, print out verbose information about the DMX ranges including par file lines.
+
+    Returns
+    -------
+    mask : bool array
+        Array with True for all TOAs that got assigned to a DMX bin
+    component : TimingModel.Component object
+        A DMX Component class with the DMX ranges included
+    """
+    from pint.models.timing_model import Component
+    import pint.models.parameter
+
+    MJDs = toas.get_mjds()
+    freqs = toas.table["freq"].quantity
+
+    DMXs = []
+
+    prevbinR2 = MJDs[0] - 0.001 * u.d
+    while True:
+        # Consider all TOAs with times after the last bin up through a total span of binwidth
+        # Get indexes that should be in this bin
+        # If there are no more MJDs to process, we are done.
+        if not np.any(MJDs > prevbinR2):
+            break
+        startMJD = MJDs[MJDs > prevbinR2][0]
+        binidx = np.logical_and(MJDs > prevbinR2, MJDs <= startMJD + binwidth)
+        if not np.any(binidx):
+            break
+        binMJDs = MJDs[binidx]
+        binfreqs = freqs[binidx]
+        loMJDs = binMJDs[binfreqs < divide_freq]
+        hiMJDs = binMJDs[binfreqs >= divide_freq]
+        # If we have freqs below and above the divide, this is a good bin
+        if np.any(binfreqs < divide_freq) and np.any(binfreqs > divide_freq):
+            DMXs.append(dmxrange(list(loMJDs), list(hiMJDs)))
+        else:
+            # These TOAs cannot be used
+            pass
+        prevbinR2 = binMJDs.max()
+
+    if verbose:
+        print(
+            "\n These are the good DMX ranges with number of TOAs above/below the dividing freq:"
+        )
+        for DMX in DMXs:
+            DMX.sum_print()
+
+    # Init mask to all False
+    mask = np.zeros_like(MJDs.value, dtype=np.bool)
+    # Mark TOAs as True if they are in any DMX bin
+    for DMX in DMXs:
+        mask[np.logical_and(MJDs >= DMX.min, MJDs <= DMX.max)] = True
+    log.info("{} out of {} TOAs are in a DMX bin".format(mask.sum(), len(mask)))
+    # Instantiate a DMX component
+    dmx_class = Component.component_types["DispersionDMX"]
+    dmx_comp = dmx_class()
+    # Add parameters
+    for ii, DMX in enumerate(DMXs):
+        if ii == 0:
+            # Already have DMX_0001 in component, so just set parameters
+            dmx_comp.DMX_0001.value = 0.0
+            dmx_comp.DMX_0001.frozen = False
+            dmx_comp.DMXR1_0001.value = DMX.min.value
+            dmx_comp.DMXR2_0001.value = DMX.max.value
+
+        else:
+            # Add the DMX parameters
+            dmx_par = pint.models.parameter.prefixParameter(
+                parameter_type="float",
+                name="DMX_{:04d}".format(ii + 1),
+                value=0.0,
+                units=u.pc / u.cm ** 3,
+                frozen=False,
+            )
+            dmx_comp.add_param(dmx_par, setup=True)
+
+            dmxr1_par = pint.models.parameter.prefixParameter(
+                parameter_type="mjd",
+                name="DMXR1_{:04d}".format(ii + 1),
+                value=DMX.min.value,
+                units=u.d,
+            )
+            dmx_comp.add_param(dmxr1_par, setup=True)
+
+            dmxr2_par = pint.models.parameter.prefixParameter(
+                parameter_type="mjd",
+                name="DMXR2_{:04d}".format(ii + 1),
+                value=DMX.max.value,
+                units=u.d,
+            )
+            dmx_comp.add_param(dmxr2_par, setup=True)
+    # Validate component
+    dmx_comp.validate()
+
+    return mask, dmx_comp
+
+
+def dmxstats(fitter):
+    """Run dmxparse in python using PINT objects and results.
+
+    Based off dmxparse by P. Demorest (https://github.com/nanograv/tempo/tree/master/util/dmxparse)
+
+    Parameters
+    ----------
+    fitter
+        PINT fitter used to get timing residuals, must have already run GLS fit
+    """
+
+    model = fitter.model
+    mjds = fitter.toas.get_mjds()
+    freqs = fitter.toas.table["freq"]
+    ii = 1
+    while hasattr(model, "DMX_{:04d}".format(ii)):
+        mmask = np.logical_and(
+            mjds.value > getattr(model, "DMXR1_{:04d}".format(ii)).value,
+            mjds.value < getattr(model, "DMXR2_{:04d}".format(ii)).value,
+        )
+        if np.any(mmask):
+            mjds_in_bin = mjds[mmask]
+            freqs_in_bin = freqs[mmask]
+            span = (mjds_in_bin.max() - mjds_in_bin.min()).to(u.d)
+            # Warning: min() and max() seem to strip the units
+            freqspan = freqs_in_bin.max() - freqs_in_bin.min()
+            print(
+                "DMX_{:04d}: NTOAS={:5d}, MJDSpan={:14.4f}, FreqSpan={:8.3f}-{:8.3f}".format(
+                    ii, mmask.sum(), span, freqs_in_bin.min(), freqs_in_bin.max()
+                )
+            )
+        else:
+            print(
+                "DMX_{:04d}: NTOAS={:5d}, MJDSpan={:14.4f}, FreqSpan={:8.3f}-{:8.3f}".format(
+                    ii, mmask.sum(), 0 * u.d, 0 * u.MHz, 0 * u.MHz
+                )
+            )
+        ii += 1
+
+    return
+
+
 def dmxparse(fitter, save=False):
     """Run dmxparse in python using PINT objects and results.
 
@@ -465,7 +853,7 @@ def dmxparse(fitter, save=False):
         if True saves output to text file in the format of the TEMPO version.
         If not output save file is desired, save = False (which is the default)
         Output file name is dmxparse.out
-    
+
     Returns
     -------
     dictionary
@@ -486,13 +874,20 @@ def dmxparse(fitter, save=False):
 
         avg_dm_err : uncertainty in average dmx
 
+    Raises
+    ------
+    RuntimeError : If the model has no DMX parameters, or if there is a parsing problem
+
     """
     # We get the DMX values, errors, and mjds (same as in getting the DMX values for DMX v. time)
     # Get number of DMX epochs
-    dmx_epochs = 0
+    dmx_epochs = []
     for p in fitter.model.params:
         if "DMX_" in p:
-            dmx_epochs += 1
+            dmx_epochs.append(p.split("_")[-1])
+    # Check to make sure that there are DMX values in the model
+    if not dmx_epochs:
+        raise RuntimeError("No DMX values in model!")
     # Get DMX values (will be in units of 10^-3 pc cm^-3)
     DMX_keys = []
     DMXs = []
@@ -500,14 +895,14 @@ def dmxparse(fitter, save=False):
     DMX_R1 = []
     DMX_R2 = []
     DMX_center_MJD = []
-    for ii in range(1, dmx_epochs + 1):
-        DMX_keys.append("DMX_{:04d}".format(ii))
-        DMXs.append(getattr(fitter.model, "DMX_{:04d}".format(ii)).value)
-        DMX_Errs.append(
-            getattr(fitter.model, "DMX_{:04d}".format(ii)).uncertainty_value
-        )
-        dmxr1 = getattr(fitter.model, "DMXR1_{:04d}".format(ii)).value
-        dmxr2 = getattr(fitter.model, "DMXR2_{:04d}".format(ii)).value
+    mask_idxs = []
+    for ii in dmx_epochs:
+        DMX_keys.append("DMX_{:}".format(ii))
+        DMXs.append(getattr(fitter.model, "DMX_{:}".format(ii)).value)
+        mask_idxs.append(getattr(fitter.model, "DMX_{:}".format(ii)).frozen)
+        DMX_Errs.append(getattr(fitter.model, "DMX_{:}".format(ii)).uncertainty_value)
+        dmxr1 = getattr(fitter.model, "DMXR1_{:}".format(ii)).value
+        dmxr2 = getattr(fitter.model, "DMXR2_{:}".format(ii)).value
         DMX_R1.append(dmxr1)
         DMX_R2.append(dmxr2)
         DMX_center_MJD.append((dmxr1 + dmxr2) / 2)
@@ -516,35 +911,64 @@ def dmxparse(fitter, save=False):
     DMX_R1 = np.array(DMX_R1)
     DMX_R2 = np.array(DMX_R2)
     DMX_center_MJD = np.array(DMX_center_MJD)
+    # If any value need to be masked, do it
+    if True in mask_idxs:
+        log.warning(
+            "Some DMX bins were not fit for, masking these bins for computation."
+        )
+        DMX_Errs = np.ma.array(DMX_Errs, mask=mask_idxs)
+        DMX_keys_ma = np.ma.array(DMX_keys, mask=mask_idxs)
+    else:
+        DMX_keys_ma = None
 
-    # now get the full parameter covariance matrix from pint
-    # NOTE: we will need to increase all indices by 1 to account for the 'Offset' parameter
-    # that is the first index of the designmatrix
-    params = np.array(list(fitter.get_fitparams().keys()))
-    p_cov_mat = fitter.covariance_matrix
-    # Now we get the indices that correspond to the DMX values
-    DMX_p_idxs = np.zeros(dmx_epochs, dtype=int)
-    for ii in range(dmx_epochs):
-        DMX_p_idxs[ii] = (
-            int(np.where(params == DMX_keys[ii])[0]) + 1
-        )  # extra 1 is for offset parameters
-    # Sort the array in numerical order for 2.7. 3.5
-    DMX_p_idxs = np.sort(DMX_p_idxs)
-    # Define a matrix that is just the DMX covariances
-    cc = p_cov_mat[
-        DMX_p_idxs[0] : DMX_p_idxs[-1] + 1, DMX_p_idxs[0] : DMX_p_idxs[-1] + 1
-    ]
-    n = len(DMX_Errs)
-    # Find error in mean DM
-    DMX_mean = np.mean(DMXs)
-    DMX_mean_err = np.sqrt(cc.sum()) / float(n)
-    # Do the correction for varying DM
-    m = np.identity(n) - np.ones((n, n)) / float(n)
-    cc = np.dot(np.dot(m, cc), m)
-    DMX_vErrs = np.zeros(n)
-    # We also need to correct for the units here
-    for i in range(n):
-        DMX_vErrs[i] = np.sqrt(cc[i, i])
+    # Make sure that the fitter has a covariance matrix, otherwise return the initial values
+    if hasattr(fitter, "covariance_matrix"):
+        # now get the full parameter covariance matrix from pint
+        # NOTE: we will need to increase all indices by 1 to account for the 'Offset' parameter
+        # that is the first index of the designmatrix
+        params = np.array(list(fitter.get_fitparams().keys()))
+        p_cov_mat = fitter.covariance_matrix
+        # Now we get the indices that correspond to the DMX values
+        DMX_p_idxs = np.zeros(len(dmx_epochs), dtype=int)
+        for ii in range(len(dmx_epochs)):
+            if DMX_keys_ma is None:
+                key = DMX_keys[ii]
+            else:
+                key = DMX_keys_ma[ii]
+            if "DMX" not in key:
+                pass
+            else:
+                DMX_p_idxs[ii] = (
+                    int(np.where(params == key)[0]) + 1
+                )  # extra 1 is for offset parameters
+        # Sort the array in numerical order for 2.7. 3.5
+        DMX_p_idxs = np.trim_zeros(np.sort(DMX_p_idxs))
+        # Define a matrix that is just the DMX covariances
+        cc = p_cov_mat[
+            DMX_p_idxs[0] : DMX_p_idxs[-1] + 1, DMX_p_idxs[0] : DMX_p_idxs[-1] + 1
+        ]
+        n = len(DMX_Errs) - np.sum(mask_idxs)
+        # Find error in mean DM
+        DMX_mean = np.mean(DMXs)
+        DMX_mean_err = np.sqrt(cc.sum()) / float(n)
+        # Do the correction for varying DM
+        m = np.identity(n) - np.ones((n, n)) / float(n)
+        cc = np.dot(np.dot(m, cc), m)
+        DMX_vErrs = np.zeros(n)
+        # We also need to correct for the units here
+        for i in range(n):
+            DMX_vErrs[i] = np.sqrt(cc[i, i])
+        # If array was masked, we need to add values back in where they were masked
+        if DMX_keys_ma is not None:
+            # Only need to add value to DMX_vErrs
+            DMX_vErrs = np.insert(DMX_vErrs, np.where(mask_idxs)[0], None)
+    else:
+        log.warning(
+            "Fitter does not have covariance matrix, returning values from model"
+        )
+        DMX_mean = np.mean(DMXs)
+        DMX_mean_err = np.mean(DMX_Errs)
+        DMX_vErrs = DMX_Errs
     # Check we have the right number of params
     if len(DMXs) != len(DMX_Errs) or len(DMXs) != len(DMX_vErrs):
         log.error("ERROR! Number of DMX entries do not match!")
@@ -560,7 +984,7 @@ def dmxparse(fitter, save=False):
             "# Columns: %sEP %s_value %s_var_err %sR1 %sR2 %s_bin \n"
             % (DMX, DMX, DMX, DMX, DMX, DMX)
         )
-        for k in range(dmx_epochs):
+        for k in range(len(dmx_epochs)):
             lines.append(
                 "%.4f %+.7e %.3e %.4f %.4f %s \n"
                 % (
@@ -578,16 +1002,20 @@ def dmxparse(fitter, save=False):
     # return the new mean subtracted values
     mean_sub_DMXs = DMXs - DMX_mean
 
+    # Get units to multiply returned arrays by
+    DMX_units = getattr(fitter.model, "DMX_{:}".format(dmx_epochs[0])).units
+    DMXR_units = getattr(fitter.model, "DMXR1_{:}".format(dmx_epochs[0])).units
+
     # define the output dictionary
     dmx = {}
-    dmx["dmxs"] = mean_sub_DMXs
-    dmx["dmx_verrs"] = DMX_vErrs
-    dmx["dmxeps"] = DMX_center_MJD
-    dmx["r1s"] = DMX_R1
-    dmx["r2s"] = DMX_R2
+    dmx["dmxs"] = mean_sub_DMXs * DMX_units
+    dmx["dmx_verrs"] = DMX_vErrs * DMX_units
+    dmx["dmxeps"] = DMX_center_MJD * DMXR_units
+    dmx["r1s"] = DMX_R1 * DMXR_units
+    dmx["r2s"] = DMX_R2 * DMXR_units
     dmx["bins"] = DMX_keys
-    dmx["mean_dmx"] = DMX_mean
-    dmx["avg_dm_err"] = DMX_mean_err
+    dmx["mean_dmx"] = DMX_mean * DMX_units
+    dmx["avg_dm_err"] = DMX_mean_err * DMX_units
 
     return dmx
 
@@ -794,6 +1222,10 @@ def pulsar_mass(pb, x, mc, inc):
         Companion mass in u.solMass
     inc : Angle
         Inclination angle, in u.deg or u.rad
+
+    Returns
+    -------
+    mass : Quantity in u.solMass
     """
     massfunct = mass_funct(pb, x)
 
@@ -801,7 +1233,7 @@ def pulsar_mass(pb, x, mc, inc):
     def localmf(mp, mc=mc, mf=massfunct, i=inc):
         return (mass_funct2(mp * u.solMass, mc, i) - mf).value
 
-    return zeros.bisect(localmf, 0.0, 1000.0)
+    return zeros.bisect(localmf, 0.0, 1000.0) * u.solMass
 
 
 def companion_mass(pb, x, inc=60.0 * u.deg, mpsr=1.4 * u.solMass):
@@ -820,6 +1252,10 @@ def companion_mass(pb, x, inc=60.0 * u.deg, mpsr=1.4 * u.solMass):
         Inclination angle, in u.deg or u.rad. Default is 60 deg.
     mpsr : Quantity, optional
         Pulsar mass in u.solMass. Default is 1.4 Msun
+
+    Returns
+    -------
+    mass : Quantity in u.solMass
     """
     massfunct = mass_funct(pb, x)
 
@@ -827,7 +1263,7 @@ def companion_mass(pb, x, inc=60.0 * u.deg, mpsr=1.4 * u.solMass):
     def localmf(mc, mp=mpsr, mf=massfunct, i=inc):
         return (mass_funct2(mp, mc * u.solMass, i) - mf).value
 
-    return zeros.bisect(localmf, 0.001, 1000.1)
+    return zeros.bisect(localmf, 0.001, 1000.1) * u.solMass
 
 
 def ELL1_check(A1, E, TRES, NTOA, outstring=True):
@@ -879,3 +1315,79 @@ def ELL1_check(A1, E, TRES, NTOA, outstring=True):
             s += "    *** WARNING*** Should probably use BT or DD instead!\n"
             return s
         return False
+
+
+def shklovskii_factor(pmtot, D):
+    """ 
+    Return magnitude of Shklovskii correction factor
+
+    Computes the Shklovskii correction factor, as defined in Eq 8.12 of Lorimer & Kramer (2005)
+    This is the factor by which Pdot/P is increased due to the transverse velocity.
+    Note that this affects both the measured spin period and the orbital period.
+    If we call this Shklovskii acceleration a_s, then
+        Pdot_intrinsic = Pdot_observed - a_s*P
+
+    Parameters
+    ----------
+    pmtot : Quantity, typically units of u.mas/u.yr
+        Total proper motion of the pulsar (system)
+    D : Quantity, typically in units of u.kpc or u.pc
+        Distance to the pulsar
+    """
+    # This uses the small angle approximation that sin(x) = x, so we need to
+    # make our angle dimensionless.
+    with u.set_enabled_equivalencies(u.dimensionless_angles()):
+        a_s = (D * pmtot ** 2 / const.c).to(u.s ** -1)
+    return a_s
+
+
+def FTest(chi2_1, dof_1, chi2_2, dof_2):
+    """
+    Run F-test.
+
+    Compute an F-test to see if a model with extra parameters is
+    significant compared to a simpler model.  The input values are the
+    (non-reduced) chi^2 values and the numbers of DOF for '1' the
+    original model and '2' for the new model (with more fit params).
+    The probability is computed exactly like Sherpa's F-test routine
+    (in Ciao) and is also described in the Wikipedia article on the
+    F-test:  http://en.wikipedia.org/wiki/F-test
+    The returned value is the probability that the improvement in
+    chi2 is due to chance (i.e. a low probability means that the
+    new fit is quantitatively better, while a value near 1 means
+    that the new model should likely be rejected).
+
+    Parameters
+    -----------
+    chi2_1 : Float
+        Chi-squared value of model with fewer parameters
+    dof_1 : Int
+        Degrees of freedom of model with fewer parameters
+    chi2_2 : Float
+        Chi-squared value of model with more parameters
+    dof_2 : Int
+        Degrees of freedom of model with more parameters
+
+    Returns
+    --------
+    ft : Float
+        F-test significance value for the model with the larger number of
+        components over the other.
+    """
+    delta_chi2 = chi2_1 - chi2_2
+    if delta_chi2 > 0 and dof_1 != dof_2:
+        delta_dof = dof_1 - dof_2
+        new_redchi2 = chi2_2 / dof_2
+        F = np.float64(
+            (delta_chi2 / delta_dof) / new_redchi2
+        )  # fdtr doesn't like float128
+        ft = fdtrc(delta_dof, dof_2, F)
+    else:
+        if delta_chi2 <= 0:
+            log.warning(
+                "Chi^2 for Model 2 is larger than Chi^2 for Model 1, cannot preform F-test."
+            )
+        elif dof_1 == dof_2:
+            log.warning("Models have equal degrees of freedom, cannot preform F-test.")
+        ft = False
+    return ft

@@ -5,7 +5,6 @@ import numpy as np
 from scipy.linalg import LinAlgError
 from astropy import log
 
-from pint import dimensionless_cycles
 from pint.phase import Phase
 from pint.utils import weighted_mean
 
@@ -63,7 +62,7 @@ class Residuals(object):
         # Please define what set_pulse_nums means!
 
         # Read any delta_pulse_numbers that are in the TOAs table.
-        # These are for PHASE statements as well as user-inserted phase jumps
+        # These are for PHASE statements, -padd flags, as well as user-inserted phase jumps
         # Check for the column, and if not there then create it as zeros
         try:
             delta_pulse_numbers = Phase(self.toas.table["delta_pulse_number"])
@@ -72,6 +71,7 @@ class Residuals(object):
             delta_pulse_numbers = Phase(self.toas.table["delta_pulse_number"])
 
         # I have no idea what this is trying to do. It just sets delta_pulse_number to zero
+        # This will wipe out any PHASE or -padd commands from the .tim file!!!
         if set_pulse_nums:
             self.toas.table["delta_pulse_number"] = np.zeros(len(self.toas.get_mjds()))
             delta_pulse_numbers = Phase(self.toas.table["delta_pulse_number"])
@@ -89,24 +89,23 @@ class Residuals(object):
             # Compute model phase. For pulse numbers tracking
             # we need absolute phases, since TZRMJD serves as the pulse
             # number reference.
-            rs = self.model.phase(self.toas, abs_phase=True)
+            rs = self.model.phase(self.toas, abs_phase=True) + delta_pulse_numbers
             # First assign each TOA to the correct relative pulse number
             rs -= Phase(pulse_num, np.zeros_like(pulse_num))
             # Then subtract the constant offset since that is irrelevant
             rs -= Phase(rs.int[0], rs.frac[0])
-            full = rs + delta_pulse_numbers
-            full = full.int + full.frac
+            full = rs.int + rs.frac
 
         # If not tracking then do the usual nearest pulse number calculation
         else:
             # Compute model phase
-            rs = self.model.phase(self.toas)
+            rs = self.model.phase(self.toas) + delta_pulse_numbers
             # Here it subtracts the first phase, so making the first TOA be the
             # reference. Not sure this is a good idea.
             rs -= Phase(rs.int[0], rs.frac[0])
 
             # What exactly is full?
-            full = Phase(np.zeros_like(rs.frac), rs.frac) + delta_pulse_numbers
+            full = Phase(np.zeros_like(rs.frac), rs.frac)
             # This converts full from a Phase object to a np.float128
             full = full.int + full.frac
 
@@ -130,8 +129,7 @@ class Residuals(object):
         """Return timing model residuals in time (seconds)."""
         if self.phase_resids is None:
             self.phase_resids = self.calc_phase_resids(weighted_mean=weighted_mean)
-        with u.set_enabled_equivalencies(dimensionless_cycles):
-            return (self.phase_resids.to(u.Unit("")) / self.get_PSR_freq()).to(u.s)
+        return (self.phase_resids / self.get_PSR_freq()).to(u.s)
 
     def get_PSR_freq(self, modelF0=True):
         if modelF0:
@@ -238,3 +236,69 @@ class Residuals(object):
         self.time_resids = self.calc_time_resids(weighted_mean=weighted_mean)
         self._chi2 = None  # trigger chi2 recalculation when needed
         self.dof = self.get_dof()
+
+    def ecorr_average(self, use_noise_model=True):
+        """
+        Uses the ECORR noise model time-binning to compute "epoch-averaged"
+        residuals.  Requires ECORR be used in the timing model.  If
+        use_noise_model is true, the noise model terms (EFAC, EQUAD, ECORR) will
+        be applied to the TOA uncertainties, otherwise only the raw
+        uncertainties will be used.  
+        
+        Returns a dictionary with the following entries:
+
+          mjds           Average MJD for each segment
+
+          freqs          Average topocentric frequency for each segment
+
+          time_resids    Average residual for each segment, time units
+
+          noise_resids   Dictionary of per-noise-component average residual
+
+          errors         Uncertainty on averaged residuals
+
+          indices        List of lists giving the indices of TOAs in the original
+                         TOA table for each segment
+        """
+
+        # ECORR is required
+        try:
+            ecorr = self.model.get_components_by_category()["ecorr_noise"][0]
+        except KeyError:
+            raise ValueError("ECORR not present in noise model")
+
+        # "U" matrix gives the TOA binning, "weight" is ECORR
+        # uncertainty in seconds, squared.
+        U, ecorr_err2 = ecorr.ecorr_basis_weight_pair(self.toas)
+        ecorr_err2 *= u.s * u.s
+
+        if use_noise_model:
+            err = self.model.scaled_sigma(self.toas)
+        else:
+            err = self.toas.get_errors()
+            ecorr_err2 *= 0.0
+
+        # Weight for sums, and normalization
+        wt = 1.0 / (err * err)
+        a_norm = np.dot(U.T, wt)
+
+        def wtsum(x):
+            return np.dot(U.T, wt * x) / a_norm
+
+        # Weighted average of various quantities
+        avg = {}
+        avg["mjds"] = wtsum(self.toas.get_mjds())
+        avg["freqs"] = wtsum(self.toas.get_freqs())
+        avg["time_resids"] = wtsum(self.time_resids)
+        avg["noise_resids"] = {}
+        for k in self.noise_resids.keys():
+            avg["noise_resids"][k] = wtsum(self.noise_resids[k])
+
+        # Uncertainties
+        # TODO could add an option to incorporate residual scatter
+        avg["errors"] = np.sqrt(1.0 / a_norm + ecorr_err2)
+
+        # Indices back into original TOA list
+        avg["indices"] = [list(np.where(U[:, i])[0]) for i in range(U.shape[1])]
+
+        return avg
