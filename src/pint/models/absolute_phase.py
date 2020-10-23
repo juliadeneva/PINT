@@ -42,6 +42,7 @@ class AbsPhase(PhaseComponent):
                 description="The frequency of the zero phase mearsured.",
             )
         )
+        self.tz_cache = None
 
     def setup(self):
         super(AbsPhase, self).setup()
@@ -73,22 +74,28 @@ class AbsPhase(PhaseComponent):
         to this TOA, as with any other TOA. This does not affect the
         value of the TZRMJD parmeter, however.
         """
-        # NOTE: Using TZRMJD.quantity.jd[1,2] so that the time scale can be properly
-        # set to the TZRSITE default timescale (e.g. UTC for TopoObs and TDB for SSB)
-        TZR_toa = toa.TOA(
-            (self.TZRMJD.quantity.jd1 - 2400000.5, self.TZRMJD.quantity.jd2),
-            obs=self.TZRSITE.value,
-            freq=self.TZRFRQ.quantity,
-        )
-        clkc_info = toas.clock_corr_info
-        tz = toa.get_TOAs_list(
-            [TZR_toa],
-            include_bipm=clkc_info["include_bipm"],
-            include_gps=clkc_info["include_gps"],
-            ephem=toas.ephem,
-            planets=toas.planets,
-        )
-        return tz
+
+        if self.tz_cache is not None:
+            # This should also verify that the clkc_info is the same so it is valid.
+            return self.tz_cache
+        else:
+            # NOTE: Using TZRMJD.quantity.jd[1,2] so that the time scale can be properly
+            # set to the TZRSITE default timescale (e.g. UTC for TopoObs and TDB for SSB)
+            TZR_toa = toa.TOA(
+                (self.TZRMJD.quantity.jd1 - 2400000.5, self.TZRMJD.quantity.jd2),
+                obs=self.TZRSITE.value,
+                freq=self.TZRFRQ.quantity,
+            )
+            clkc_info = toas.clock_corr_info
+            tz = toa.get_TOAs_list(
+                [TZR_toa],
+                include_bipm=clkc_info["include_bipm"],
+                include_gps=clkc_info["include_gps"],
+                ephem=toas.ephem,
+                planets=toas.planets,
+            )
+            self.tz_cache = tz
+            return tz  
 
     def make_TZR_toa(self, toas):
         """ Calculate the TZRMJD if one not given.

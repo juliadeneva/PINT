@@ -22,7 +22,7 @@ from pint.models.parameter import (
     floatParameter,
 )
 
-__all__ = ["Fitter", "PowellFitter", "GLSFitter", "WLSFitter"]
+__all__ = ["Fitter", "PowellFitter", "GLSFitter", "WLSFitter", "BoundsFitter"]
 
 
 class Fitter(object):
@@ -613,6 +613,123 @@ class PowellFitter(Fitter):
         # necessarily the one that yields the best fit
         self.minimize_func(np.atleast_1d(self.fitresult.x), *list(fitp.keys()))
 
+        return self.resids.chi2
+
+        
+class BoundsFitter(Fitter):
+    """A class for scipy.optimize fitting methods that use parameter bounds. 
+       The default is all bounds are set to None (unbounded).
+       Individual bounds are tuples of the form (lb,ub) accessed like this:
+       ftr.bounds['M2'] = (0.1,0.5)
+       For one-sided bounds, use None for the unbounded side.
+    """
+
+    def __init__(self, toas, model):
+        super(BoundsFitter, self).__init__(toas, model)
+        self.method = 'L-BFGS-B'
+        #self.method = 'TNC'
+        #self.method = 'SLSQP'
+        self.bounds = None
+        self.reset_bounds()
+
+    def reset_bounds(self):
+        """Set all bounds to None (no bound)"""
+        fitp = self.get_fitparams_num()
+        fitp_names = fitp.keys()
+        self.bounds = {}
+        for fitp_name in fitp_names:
+            self.bounds[fitp_name] = (None,None)
+
+    def set_bounds_errfact(self, errfact=10.0):
+        """Set bounds based on scaled parameter uncertainties"""
+        errfact = np.abs(errfact)
+        fitp = self.get_fitparams_num()
+        fitpv = np.array(list(fitp.values()))
+        fitp_names = fitp.keys()
+        fitperr = self.get_fitparams_uncertainty()
+        fitperrv = np.array(list(fitperr.values()))
+
+        # If there's no uncertainty in the par file, it is recorded as zero
+        if np.isclose(fitperrv,0,atol=1.e-50).any():
+            log.error('BoundsFitter.set_bounds_errfact(): Check that all free parameters have uncertainties in the par file.')
+            raise ValueError
+
+        lb = np.subtract(fitpv,errfact*fitperrv)
+        ub = np.add(fitpv,errfact*fitperrv)
+        bounds = tuple(zip(lb,ub))
+        self.bounds = collections.OrderedDict(zip(fitp_names,bounds))
+
+        # Check for non-physical bounds (this list is probably missing params)
+        positive_only = ['F0','DM','PB','A1','TASC','T0','M2','FB0','PX']
+        for fitp_name in fitp_names:
+            if fitp_name == 'SINI':
+                self.bounds[fitp_name] = (0.0,1.0)
+            elif fitp_name in positive_only:
+                self.bounds[fitp_name] = (np.maximum(0.0,self.bounds[fitp_name][0]), self.bounds[fitp_name][1])
+
+    def set_bounds_frac(self,frac=0.1):
+        """Set bounds based on fraction of parameter values"""
+        frac = np.abs(frac)
+        fitp = self.get_fitparams_num()
+        fitpv = np.array(list(fitp.values()))
+        fitp_names = fitp.keys()
+        lb = np.subtract(fitpv,frac*fitpv)
+        ub = np.add(fitpv,frac*fitpv)
+        bounds = tuple(zip(lb,ub))
+        self.bounds = collections.OrderedDict(zip(fitp_names,bounds))
+
+        # Check for non-physical bounds (this list is probably missing params)
+        positive_only = ['F0','DM','PB','A1','TASC','T0','M2','FB0','PX','SINI']
+        for fitp_name in fitp_names:
+            if fitp_name == 'SINI':
+                self.bounds[fitp_name] = (0.0,1.0)
+            elif fitp_name in positive_only:
+                self.bounds[fitp_name] = (np.maximum(0.0,self.bounds[fitp_name][0]), self.bounds[fitp_name][1])
+
+
+    def fit_toas(self, maxiter=20):
+        allowed_methods = ['L-BFGS-B','TNC','SLSQP']
+        if self.method not in allowed_methods:
+            log.error('BoundsFitter.method must be one of: '+' '.join(allowed_methods))
+            raise ValueError
+            
+        # Initial guesses are model params
+        fitp = self.get_fitparams_num()
+        fitp_names = fitp.keys()
+        self.fitresult = opt.minimize(
+            self.minimize_func,
+            list(fitp.values()),
+            args=tuple(fitp_names),
+            options={"maxiter": maxiter},
+            method=self.method,
+            bounds=list(self.bounds.values()),
+        )
+        # Update model and resids, as the last iteration of minimize is not
+        # necessarily the one that yields the best fit
+        self.minimize_func(np.atleast_1d(self.fitresult.x), *list(fitp_names))
+        
+        #print(self.fitresult.keys())
+        #print(self.fitresult.jac)
+        print('Status: ',self.fitresult.status)
+        print('Message: ', self.fitresult.message)
+        print('Success: ', self.fitresult.success)
+        print('Nfev: ', self.fitresult.nfev)
+        print('Nit: ', self.fitresult.nit)
+
+        # Update parameter uncertainties 
+        # This uses the approximations std_errs ~ sqrt(diag(inv(Hessian)))
+        # and Hessian ~ outer_product(Jacobian,Jacobian.T)
+        # The Jacobian returned by minimize is 1xN, where N is the number of parameters fitted. So the diagonal of the outer product is just the elementwise square of this 1D Jacobian.
+
+        jac = self.fitresult.jac
+        #values seem too small; what is the correct normalization here:
+        errs = np.sqrt(1.0/np.multiply(jac,jac)) 
+        #print(errs)
+        fitperrs = collections.OrderedDict(zip(fitp_names,errs))
+        #print(fitperrs)
+
+        self.set_param_uncertainties(fitperrs)
+        
         return self.resids.chi2
 
 
